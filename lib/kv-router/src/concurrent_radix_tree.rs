@@ -29,6 +29,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Weak;
 
 use crate::indexer::SyncIndexer;
 use crate::protocols::*;
@@ -48,8 +49,10 @@ struct Block {
     workers: FxHashSet<WorkerWithDpRank>,
     /// The external sequence block hash for this block (None for root).
     block_hash: Option<ExternalSequenceBlockHash>,
-    // NOTE: No recent_uses field.
-    // Frequency tracking is not supported - keeps find_matches fully read-only.
+    /// Weak reference to parent block for cleanup on removal.
+    parent: Option<Weak<RwLock<Block>>>,
+    /// The key under which this block is stored in parent's `children` map.
+    tokens_hash: Option<LocalBlockHash>,
 }
 
 impl Block {
@@ -59,6 +62,8 @@ impl Block {
             children: FxHashMap::default(),
             workers: FxHashSet::default(),
             block_hash: None,
+            parent: None,
+            tokens_hash: None,
         }
     }
 
@@ -68,6 +73,8 @@ impl Block {
             children: FxHashMap::default(),
             workers: FxHashSet::default(),
             block_hash: Some(block_hash),
+            parent: None,
+            tokens_hash: None,
         }
     }
 }
@@ -385,6 +392,13 @@ impl ConcurrentRadixTree {
                                 Arc::new(RwLock::new(Block::with_hash(block_data.block_hash)))
                             });
 
+                        // Set parent linkage for cleanup during removal
+                        {
+                            let mut child_guard = new_block.write();
+                            child_guard.parent = Some(Arc::downgrade(&current));
+                            child_guard.tokens_hash = Some(block_data.tokens_hash);
+                        }
+
                         parent_guard
                             .children
                             .insert(block_data.tokens_hash, new_block.clone());
@@ -410,11 +424,9 @@ impl ConcurrentRadixTree {
 
     /// Apply a remove operation.
     ///
-    /// This method does NOT cascade to descendants. Each block hash in the event
-    /// is removed individually in O(1). Descendant blocks may transiently retain
-    /// the worker in their `workers` set until their own explicit remove events
-    /// arrive. `find_matches_impl` handles this by detecting stale entries when
-    /// `child_count > active_count`.
+    /// When a block's worker set becomes empty, it is also removed from its
+    /// parent's `children` map via the stored parent weak reference, preventing
+    /// orphaned nodes from leaking memory.
     fn apply_removed(
         &self,
         worker: WorkerWithDpRank,
@@ -444,6 +456,21 @@ impl ConcurrentRadixTree {
             guard.workers.remove(&worker);
             if guard.workers.is_empty() {
                 guard.children.clear();
+
+                // Remove this block from its parent's children map to prevent
+                // orphaned nodes from accumulating.
+                if let Some(ref parent_weak) = guard.parent {
+                    if let Some(parent_arc) = parent_weak.upgrade() {
+                        if let Some(tokens_hash) = guard.tokens_hash {
+                            // Drop guard before locking parent to maintain
+                            // parent-before-child lock ordering.
+                            drop(guard);
+                            let mut parent_guard = parent_arc.write();
+                            parent_guard.children.remove(&tokens_hash);
+                            continue; // guard already dropped
+                        }
+                    }
+                }
             }
         }
 
@@ -1224,5 +1251,137 @@ mod tests {
 
             indexer.shutdown();
         }
+    }
+
+    /// Proof-of-concept: demonstrates that removing ALL blocks for a single worker
+    /// leaves orphaned entries in the root's `children` map.  After every block
+    /// hash has been removed via `apply_removed`, the root should have zero
+    /// children — but it doesn't, because `apply_removed` never cleans parent
+    /// edges.
+    #[test]
+    fn test_remove_all_blocks_leaks_root_children() {
+        let trie = ConcurrentRadixTree::new();
+        let worker = 0;
+
+        // Store [1, 2, 3] — creates root -> 1 -> 2 -> 3
+        trie.apply_event(create_store_event(worker, 1, vec![1, 2, 3], None))
+            .unwrap();
+
+        assert_eq!(trie.root.read().children.len(), 1, "root should have 1 child after store");
+        assert_eq!(trie.current_size(), 3, "worker lookup should have 3 blocks");
+
+        // Remove all 3 blocks (leaf-to-root order, as workers typically emit)
+        trie.apply_event(create_remove_event(worker, 2, vec![3]))
+            .unwrap();
+        trie.apply_event(create_remove_event(worker, 3, vec![2]))
+            .unwrap();
+        trie.apply_event(create_remove_event(worker, 4, vec![1]))
+            .unwrap();
+
+        // Worker lookup is empty — blocks are gone from the per-worker table
+        assert_eq!(trie.current_size(), 0, "worker lookup should be empty after removing all blocks");
+
+        // BUG: root.children still has an entry pointing to the orphaned node for block 1.
+        // This Arc<RwLock<Block>> is kept alive solely by this dangling parent edge.
+        let root_children_count = trie.root.read().children.len();
+        assert_eq!(
+            root_children_count, 0,
+            "LEAK: root.children still has {} orphaned entries after all blocks removed",
+            root_children_count
+        );
+    }
+
+    /// Verify that orphaned blocks are cleaned up from parent's children map
+    /// after removal, including with shared prefixes.
+    #[test]
+    fn test_no_orphans_after_removal() {
+        eprintln!("Block struct size: {} bytes", std::mem::size_of::<Block>());
+
+        // === Case 1: Single worker, all blocks removed → root children cleaned ===
+        let trie = ConcurrentRadixTree::new();
+        trie.apply_event(create_store_event(0, 1, vec![1, 2, 3], None)).unwrap();
+        trie.apply_event(create_remove_event(0, 2, vec![3, 2, 1])).unwrap();
+
+        assert_eq!(trie.root.read().children.len(), 0,
+            "root.children should be empty after all blocks removed");
+
+        // === Case 2: Shared prefix — orphans at divergence point cleaned up ===
+        let trie2 = ConcurrentRadixTree::new();
+        trie2.apply_event(create_store_event(0, 1, vec![1, 2, 3], None)).unwrap();
+        trie2.apply_event(create_store_event(1, 1, vec![1, 2, 4], None)).unwrap();
+
+        // Worker 0 evicts all its blocks
+        trie2.apply_event(create_remove_event(0, 2, vec![3, 2, 1])).unwrap();
+
+        let root2 = trie2.root.read();
+        let b1 = root2.children.get(&LocalBlockHash(1)).unwrap().read();
+        let b2 = b1.children.get(&LocalBlockHash(2)).unwrap().read();
+
+        // block_2 should only have block_4 (worker 1), block_3 should be cleaned up
+        assert_eq!(b2.children.len(), 1,
+            "block_2 should have 1 child (block_4 for worker 1), orphaned block_3 cleaned up");
+        assert!(b2.children.contains_key(&LocalBlockHash(4)));
+        drop(b2);
+        drop(b1);
+        drop(root2);
+
+        // === Case 3: Production simulation — no orphans after eviction ===
+        let trie3 = ConcurrentRadixTree::new();
+        let shared_prefix: Vec<u64> = (0..64).collect();
+
+        for w in 0u64..8 {
+            let mut seq = shared_prefix.clone();
+            let suffix: Vec<u64> = (0..16).map(|i| 1000 + w * 100 + i).collect();
+            seq.extend(&suffix);
+            trie3.apply_event(create_store_event(w, 1, seq, None)).unwrap();
+        }
+
+        // Evict workers 0-6
+        for w in 0u64..7 {
+            let mut all_hashes: Vec<u64> = shared_prefix.clone();
+            let suffix: Vec<u64> = (0..16).map(|i| 1000 + w * 100 + i).collect();
+            all_hashes.extend(&suffix);
+            trie3.apply_event(create_remove_event(w, 2, all_hashes)).unwrap();
+        }
+
+        // Walk to divergence point and verify only worker 7's child remains
+        let root3 = trie3.root.read();
+        let mut node = root3.children.get(&LocalBlockHash(0)).unwrap().clone();
+        drop(root3);
+        for i in 1..64u64 {
+            let next = node.read().children.get(&LocalBlockHash(i)).unwrap().clone();
+            node = next;
+        }
+        let divergence_node = node.read();
+        assert_eq!(divergence_node.children.len(), 1,
+            "only worker 7's suffix should remain at divergence point, all orphans cleaned up");
+    }
+
+    /// Same leak but at scale: repeated store/remove cycles cause unbounded
+    /// growth of the root's children map with unique prefixes.
+    #[test]
+    fn test_store_remove_cycles_leak_memory() {
+        let trie = ConcurrentRadixTree::new();
+        let worker = 0;
+
+        let num_cycles = 1000;
+        for i in 0..num_cycles {
+            let base = (i * 10) as u64; // unique prefix each cycle
+            trie.apply_event(create_store_event(worker, i * 2, vec![base, base + 1], None))
+                .unwrap();
+            // Remove both blocks
+            trie.apply_event(create_remove_event(worker, i * 2 + 1, vec![base + 1, base]))
+                .unwrap();
+        }
+
+        assert_eq!(trie.current_size(), 0, "worker lookup should be empty");
+
+        // BUG: root.children has accumulated 1000 orphaned entries
+        let root_children_count = trie.root.read().children.len();
+        assert_eq!(
+            root_children_count, 0,
+            "LEAK: root.children has {} orphaned entries after {} store/remove cycles",
+            root_children_count, num_cycles
+        );
     }
 }

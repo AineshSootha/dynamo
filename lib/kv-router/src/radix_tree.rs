@@ -17,7 +17,7 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
@@ -40,34 +40,34 @@ pub(crate) struct RadixBlock {
     pub(crate) block_hash: Option<ExternalSequenceBlockHash>,
     /// A buffer of times that this block was last traversed
     pub(crate) recent_uses: VecDeque<Instant>,
+    /// Weak reference to parent block for cleanup on removal.
+    parent: Option<Weak<RefCell<RadixBlock>>>,
+    /// The key under which this block is stored in parent's `children` map.
+    tokens_hash: Option<LocalBlockHash>,
 }
 
 impl RadixBlock {
     /// Create a new `RadixBlock` (used for root node).
-    ///
-    /// ### Returns
-    ///
-    /// A new `RadixBlock` with no block_hash.
     pub fn new() -> Self {
         Self {
             children: FxHashMap::default(),
             workers: FxHashSet::default(),
             block_hash: None,
             recent_uses: VecDeque::new(),
+            parent: None,
+            tokens_hash: None,
         }
     }
 
     /// Create a new `RadixBlock` with a specific block hash.
-    ///
-    /// ### Returns
-    ///
-    /// A new `RadixBlock` with the given block_hash.
     pub fn with_hash(block_hash: ExternalSequenceBlockHash) -> Self {
         Self {
             children: FxHashMap::default(),
             workers: FxHashSet::default(),
             block_hash: Some(block_hash),
             recent_uses: VecDeque::new(),
+            parent: None,
+            tokens_hash: None,
         }
     }
 }
@@ -365,6 +365,7 @@ impl RadixTree {
                     }
                     needs_worker_insert = true;
 
+                    let mut is_new_child = false;
                     let child = match parent_mut.children.get(&block_data.tokens_hash) {
                         Some(block) => {
                             // Verify our simplifying assumption: block_hash is uniform across workers
@@ -391,6 +392,7 @@ impl RadixTree {
                                 .children
                                 .insert(block_data.tokens_hash, new_block.clone());
 
+                            is_new_child = true;
                             new_block
                         }
                     };
@@ -411,6 +413,15 @@ impl RadixTree {
                     worker_lookup.insert(block_data.block_hash, child.clone());
 
                     drop(parent_mut);
+
+                    // Set parent linkage after dropping parent borrow to avoid
+                    // RefCell conflicts. Only needed for newly inserted children.
+                    if is_new_child {
+                        let mut child_mut = child.borrow_mut();
+                        child_mut.parent = Some(Rc::downgrade(&current));
+                        child_mut.tokens_hash = Some(block_data.tokens_hash);
+                    }
+
                     current = child;
                 }
 
@@ -435,9 +446,6 @@ impl RadixTree {
                                 block_hash = ?block,
                                 "Failed to find block to remove; skipping remove operation"
                             );
-                            // Kv cache removed events may be batched; we should try to apply all
-                            // operations in the batch before returning an error. Return the first
-                            // error.
                             if kv_cache_err.is_none() {
                                 kv_cache_err = Some(KvCacheEventError::BlockNotFound);
                             }
@@ -448,8 +456,19 @@ impl RadixTree {
                     let mut guard = entry.borrow_mut();
                     guard.workers.remove(&worker);
                     if guard.workers.is_empty() {
-                        // if no workers are using this block, that is true for all children
                         guard.children.clear();
+
+                        // Remove this block from its parent's children map
+                        if let Some(ref parent_weak) = guard.parent {
+                            if let Some(parent_rc) = parent_weak.upgrade() {
+                                if let Some(tokens_hash) = guard.tokens_hash {
+                                    drop(guard);
+                                    parent_rc.borrow_mut().children.remove(&tokens_hash);
+                                    worker_lookup.remove(&block);
+                                    continue; // guard already dropped
+                                }
+                            }
+                        }
                     }
                     // remove the block from the worker's lookup table
                     worker_lookup.remove(&block);
@@ -772,6 +791,8 @@ mod tests {
                 .len(),
             2
         );
+        // Block 4 had only worker_2; after removal its workers set is empty,
+        // so it is cleaned up from block_1's children. Only block_2 remains.
         assert_eq!(
             trie.root
                 .borrow()
@@ -781,7 +802,7 @@ mod tests {
                 .borrow()
                 .children
                 .len(),
-            2
+            1
         );
 
         trie.apply_event(create_store_event(
@@ -839,6 +860,8 @@ mod tests {
                 .len(),
             2
         );
+        // block_1 has only block_2 as child (block_4 was cleaned up earlier
+        // when its workers became empty after worker_2's removal).
         assert_eq!(
             trie.root
                 .borrow()
@@ -848,7 +871,7 @@ mod tests {
                 .borrow()
                 .children
                 .len(),
-            2
+            1
         );
         assert_eq!(
             trie.lookup
