@@ -195,17 +195,19 @@ impl
             }
         };
 
-        // NVBugs 5969206: Do NOT abort decode routing when context is killed.
-        // In disaggregated serving, the prefill may have completed and KV transfer
-        // is in flight. Blocking decode here orphans the transfer (no receiver)
-        // and leaks KV blocks permanently. The decode handler's
-        // kv_transfer_complete_event guard will clean up after KV is received.
-        // Log-only; decode routing must proceed for KV transfer cleanup.
+        // Skip decode routing when client has disconnected. Since vLLM commit
+        // 8e32690 ("scheduler: Delay freeing blocks of aborted async loads"),
+        // aborting during in-flight NIXL transfers is safe — blocks are freed
+        // once the transfer completes. Routing dead requests to decode wastes
+        // GPU cycles and causes KV cache convoy effects under load.
         if engine_ctx.is_stopped() || engine_ctx.is_killed() {
-            tracing::debug!(
-                "Context {} killed/stopped after prefill, allowing decode routing for KV transfer",
+            tracing::warn!(
+                "Context {} killed/stopped after prefill, skipping decode routing (client disconnected)",
                 engine_ctx.id()
             );
+            return Err(anyhow::anyhow!(
+                "Client disconnected during prefill, skipping decode"
+            ));
         }
 
         // Handle prefill result
