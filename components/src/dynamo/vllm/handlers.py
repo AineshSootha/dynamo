@@ -73,98 +73,51 @@ logger = logging.getLogger(__name__)
 
 
 class _DeferredAbort:
-    """Defers engine_client.abort(request_id) until the first engine output.
+    """Abort guard for disaggregated decode requests.
 
-    In disaggregated decode mode, calling engine_client.abort() while a NIXL
-    KV transfer is still in flight on the decode worker can crash EngineCore.
-    This guard delays the real abort call until the first generation result
-    has been yielded (which, for a decode worker, means the KV transfer has
-    completed and the engine has produced at least one token).
+    Aborts the engine request immediately when a client disconnect is
+    detected, regardless of whether the first token has been produced.
 
-    When abort() is called before the first token, a background asyncio.Task
-    is spawned to wait for the first-token signal and then perform the real
-    abort.
+    Since vLLM commit 8e32690 (scheduler: Delay freeing blocks of aborted
+    async loads), the scheduler safely handles aborting requests that are in
+    WAITING_FOR_REMOTE_KVS state: blocks are marked for delayed freeing and
+    released once the NIXL transfer naturally completes. There is no longer
+    a risk of crashing EngineCore by aborting during an in-flight transfer.
+
+    Immediate abort is critical for liveness: without it, dead-client
+    requests hold KV cache blocks until the full transfer-schedule-generate
+    cycle completes, which under load can saturate KV cache and cause a
+    multi-minute availability outage.
     """
 
     def __init__(self, engine_client: Any, request_id: str):
         self._engine_client = engine_client
         self._request_id = request_id
-        self._first_token_received = False
-        self._first_token_event = asyncio.Event()
-        # Strong reference to the deferred-abort background task so it is not
-        # garbage collected mid-execution (asyncio.create_task only holds a
-        # weak reference via the event loop).
-        self._abort_task: Optional[asyncio.Task] = None
+        self._aborted = False
 
     def signal_first_token(self) -> None:
         """Called when the first engine output for the request is received."""
-        if not self._first_token_received:
-            self._first_token_received = True
-            self._first_token_event.set()
+        pass
 
     async def abort(self) -> None:
-        """Abort immediately if first token received, otherwise defer."""
-        if self._first_token_received:
-            await self._engine_client.abort(self._request_id)
-            logger.debug(
-                f"Deferred abort: first token already received, "
-                f"aborting request {self._request_id} now"
-            )
-        elif self._abort_task is None:
-            logger.debug(
-                f"Deferred abort: first token not received for request "
-                f"{self._request_id}, spawning background task"
-            )
-            self._abort_task = asyncio.create_task(self._wait_and_abort())
-
-    async def _wait_and_abort(self) -> None:
-        """Background task: wait for first token, then abort."""
-        try:
-            await self._first_token_event.wait()
-        except Exception:
-            pass
+        """Abort the request in the engine immediately."""
+        if self._aborted:
+            return
+        self._aborted = True
         try:
             await self._engine_client.abort(self._request_id)
             logger.debug(
-                f"Deferred abort: background task fired abort for request "
-                f"{self._request_id}"
+                f"Abort guard: aborted request {self._request_id}"
             )
         except Exception as e:
             logger.warning(
-                f"Deferred abort: background abort failed for request "
+                f"Abort guard: failed to abort request "
                 f"{self._request_id}: {e}"
             )
 
     async def close(self) -> None:
-        """Clean up the deferred-abort waiter when generation exits.
-
-        Handles case 1b: if abort() was requested before the first token
-        arrived AND the generation loop exits without ever producing output,
-        the background _wait_and_abort task would otherwise remain parked on
-        first_token_event.wait() forever. Cancel it so it does not leak.
-
-        Safety invariant: this method must NOT call engine_client.abort() in
-        the pre-first-token window. Issuing abort before the engine has
-        produced output is exactly what this guard exists to avoid (it can
-        crash EngineCore while a NIXL KV transfer is still in flight on the
-        decode worker).
-        """
-        if self._abort_task is None:
-            return
-
-        if not self._first_token_received:
-            # Case 1b: cancel the local waiter without firing the real abort.
-            self._abort_task.cancel()
-
-        try:
-            await self._abort_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(
-                f"Deferred abort: cleanup observed error for request "
-                f"{self._request_id}: {e}"
-            )
+        """No-op cleanup; abort is fired eagerly in abort()."""
+        pass
 
 
 @asynccontextmanager
@@ -174,10 +127,7 @@ async def _deferred_abort_guard(
     """Own the _DeferredAbort lifecycle for a single request.
 
     Yields a _DeferredAbort in disaggregated-decode mode, otherwise yields
-    None. On exit, awaits guard.close() so the background waiter cannot leak
-    when generation finishes without producing output (case 1b). close() is
-    specifically designed not to call engine_client.abort() in the unsafe
-    pre-first-token window.
+    None.
     """
     guard = _DeferredAbort(engine_client, request_id) if is_decode_only else None
     try:

@@ -586,25 +586,22 @@ class TestBuildEmbeddingParams:
 class TestDeferredAbort:
     """Tests for ``_DeferredAbort`` used in disaggregated decode mode.
 
-    Purpose: when a request is cancelled before the decode worker has
-    received the first token, the underlying NIXL KV transfer may still be
-    in flight. Calling ``engine_client.abort(request_id)`` at that moment
-    can crash EngineCore. ``_DeferredAbort`` delays the real abort call
-    until the first engine output has been signalled.
+    The abort guard fires engine_client.abort() immediately on client
+    disconnect. Since vLLM commit 8e32690, the scheduler safely handles
+    aborting requests during in-flight NIXL KV transfers by delaying
+    block freeing until the transfer completes.
     """
 
     @pytest.mark.asyncio
-    async def test_abort_before_first_token_does_not_fire_immediately(self):
-        """abort() before first token should NOT call engine_client.abort yet."""
+    async def test_abort_fires_immediately_regardless_of_first_token(self):
+        """abort() must call engine_client.abort immediately."""
         engine_client = MagicMock()
         engine_client.abort = AsyncMock()
         guard = mod._DeferredAbort(engine_client, "req-1")
 
         await guard.abort()
 
-        # Allow the event loop to schedule any background task.
-        await asyncio.sleep(0)
-        engine_client.abort.assert_not_called()
+        engine_client.abort.assert_awaited_once_with("req-1")
 
     @pytest.mark.asyncio
     async def test_abort_after_first_token_fires_immediately(self):
@@ -619,28 +616,8 @@ class TestDeferredAbort:
         engine_client.abort.assert_awaited_once_with("req-2")
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(5)
-    async def test_deferred_background_task_fires_after_first_token(self):
-        """Background task should call abort once first token is signalled."""
-        engine_client = MagicMock()
-        engine_client.abort = AsyncMock()
-        guard = mod._DeferredAbort(engine_client, "req-3")
-
-        await guard.abort()  # Spawns background task
-
-        await asyncio.sleep(0)
-        engine_client.abort.assert_not_called()
-
-        guard.signal_first_token()
-        # Yield repeatedly so the background task can progress.
-        for _ in range(5):
-            await asyncio.sleep(0)
-
-        engine_client.abort.assert_awaited_once_with("req-3")
-
-    @pytest.mark.asyncio
-    async def test_signal_first_token_is_idempotent(self):
-        """Calling signal_first_token multiple times is safe."""
+    async def test_signal_first_token_is_noop(self):
+        """signal_first_token is a no-op kept for interface compatibility."""
         engine_client = MagicMock()
         engine_client.abort = AsyncMock()
         guard = mod._DeferredAbort(engine_client, "req-4")
@@ -654,7 +631,7 @@ class TestDeferredAbort:
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
     async def test_monitor_abort_routes_through_guard(self):
-        """_monitor_abort should call guard.abort() instead of engine_client.abort()."""
+        """_monitor_abort should call guard.abort() which aborts immediately."""
         handler = _make_handler()
         handler.engine_client = MagicMock()
         handler.engine_client.abort = AsyncMock()
@@ -666,16 +643,10 @@ class TestDeferredAbort:
         context.async_killed_or_stopped.return_value = killed_future
 
         guard = mod._DeferredAbort(handler.engine_client, "req-5")
-        # First token NOT received — guard should defer, not call engine_client.abort now.
         await handler._monitor_abort(
             context, "req-5", is_prefill=False, abort_guard=guard
         )
 
-        await asyncio.sleep(0)
-        handler.engine_client.abort.assert_not_called()
-
-        # Now signal first token and let the deferred background task fire.
-        guard.signal_first_token()
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -699,11 +670,11 @@ class TestDeferredAbort:
 
         handler.engine_client.abort.assert_awaited_once_with("req-6")
 
-    # close() cleanup tests: case 1b safety
+    # Immediate abort tests
 
     @pytest.mark.asyncio
-    async def test_close_without_pending_abort_is_noop(self):
-        """close() with no deferred abort must not call engine_client.abort."""
+    async def test_close_without_prior_abort_is_noop(self):
+        """close() with no prior abort must not call engine_client.abort."""
         engine_client = MagicMock()
         engine_client.abort = AsyncMock()
         guard = mod._DeferredAbort(engine_client, "req-close-1")
@@ -714,81 +685,56 @@ class TestDeferredAbort:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_close_cancels_waiter_without_abort_when_no_first_token(self):
-        """Case 1b: close() must cancel the waiter without firing abort.
+    async def test_abort_fires_immediately_before_first_token(self):
+        """abort() must call engine_client.abort immediately even without first token.
 
-        The abort guard exists to avoid calling engine_client.abort before the
-        first engine output arrives (unsafe during NIXL KV transfer). The
-        cleanup path must preserve that invariant.
+        Since vLLM safely handles aborting requests in WAITING_FOR_REMOTE_KVS
+        state (blocks are delayed-freed), immediate abort is safe and critical
+        for liveness.
         """
         engine_client = MagicMock()
         engine_client.abort = AsyncMock()
-        guard = mod._DeferredAbort(engine_client, "req-close-1b")
+        guard = mod._DeferredAbort(engine_client, "req-immediate")
 
-        # No first token; this spawns the background waiter.
         await guard.abort()
-        await asyncio.sleep(0)
-        engine_client.abort.assert_not_called()
-        assert guard._abort_task is not None
-        assert not guard._abort_task.done()
 
-        await guard.close()
-
-        engine_client.abort.assert_not_called()
-        assert guard._abort_task.done()
-        assert guard._abort_task.cancelled()
+        engine_client.abort.assert_awaited_once_with("req-immediate")
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_close_awaits_deferred_abort_when_first_token_received(self):
-        """close() after first token must let the now-safe deferred abort finish."""
+    async def test_abort_fires_immediately_after_first_token(self):
+        """abort() after first token also aborts immediately."""
         engine_client = MagicMock()
         engine_client.abort = AsyncMock()
-        guard = mod._DeferredAbort(engine_client, "req-close-first-tok")
-
-        await guard.abort()
-        await asyncio.sleep(0)
-        engine_client.abort.assert_not_called()
+        guard = mod._DeferredAbort(engine_client, "req-after-tok")
 
         guard.signal_first_token()
+        await guard.abort()
 
-        await guard.close()
-
-        engine_client.abort.assert_awaited_once_with("req-close-first-tok")
-        assert guard._abort_task is not None
-        assert guard._abort_task.done()
-        assert not guard._abort_task.cancelled()
+        engine_client.abort.assert_awaited_once_with("req-after-tok")
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_close_observes_already_completed_deferred_abort(self):
-        """close() is safe when the background waiter already ran to completion."""
+    async def test_abort_is_idempotent(self):
+        """Multiple abort() calls must only fire one engine abort."""
         engine_client = MagicMock()
         engine_client.abort = AsyncMock()
-        guard = mod._DeferredAbort(engine_client, "req-close-done")
+        guard = mod._DeferredAbort(engine_client, "req-idempotent")
 
         await guard.abort()
-        guard.signal_first_token()
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await guard.abort()
+        await guard.abort()
 
-        assert guard._abort_task is not None
-        assert guard._abort_task.done()
-        engine_client.abort.assert_awaited_once_with("req-close-done")
-
-        # close() must not re-issue abort and must not raise.
-        await guard.close()
-        engine_client.abort.assert_awaited_once_with("req-close-done")
+        engine_client.abort.assert_awaited_once_with("req-idempotent")
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(5)
-    async def test_generate_token_mode_closes_guard_on_no_output(self):
-        """_generate_token_mode awaits guard cleanup when decode yields nothing.
+    async def test_generate_token_mode_aborts_on_client_disconnect(self):
+        """_generate_token_mode aborts immediately when client disconnects.
 
-        Verifies that in decode-only mode, when generate_tokens exits without
-        yielding any output, _generate_token_mode still awaits the deferred
-        abort guard's close() method, and does not call engine_client.abort
-        in the pre-first-token window.
+        Verifies that in decode-only mode, when the client disconnects
+        (context killed), the abort guard fires engine_client.abort
+        immediately without waiting for first token.
         """
         config = _make_config(disaggregation_mode="DECODE")
         handler = _make_handler(config=config)
@@ -824,7 +770,6 @@ class TestDeferredAbort:
         context.async_killed_or_stopped.return_value = killed_future
 
         async def _empty_gen(*args, **kwargs):
-            # Decode yields nothing: the case-1b shape.
             await asyncio.sleep(0)
             if False:
                 yield None
@@ -854,9 +799,6 @@ class TestDeferredAbort:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        # _generate_token_mode must have awaited guard cleanup, and must not
-        # have called engine_client.abort in the pre-first-token window.
         guard.close.assert_awaited_once()
-        handler.engine_client.abort.assert_not_called()
-        if guard._abort_task is not None:
-            assert guard._abort_task.done()
+        # With immediate abort, the engine abort IS called when client disconnects
+        handler.engine_client.abort.assert_awaited_once_with("req-decode-1b")
