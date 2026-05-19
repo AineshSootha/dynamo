@@ -152,14 +152,9 @@ impl
                 prefill_req.bootstrap_info = Some(bootstrap_info.clone());
 
                 // NVBugs 5969206: Do NOT link prefill as child of engine context.
-                // Kill propagation tears down the RPC transport, interrupting NIXL
-                // KV cache transfers and leaking blocks permanently. The prefill
-                // runs to completion independently; blocks are freed via the normal
-                // completion path (state 21→22).
-                // NOTE: This means prefill runs to completion even if the client
-                // disconnects, wasting prefill compute. This is an accepted
-                // trade-off (wasted compute vs permanent KV block leak). Future
-                // work: add NIXL-level cancellation that properly frees blocks.
+                // Kill propagation tears down Dynamo's RPC transport, interrupting
+                // NIXL KV transfers at the transport level and leaking blocks
+                // permanently. The prefill runs to completion independently.
                 let prefill_context = Context::with_id(prefill_req, request_id.clone());
 
                 // Pass the phase barrier to the spawned task. It is released after routing
@@ -178,7 +173,7 @@ impl
                 // so there is no race with set_phase(Decode) below.
                 drop(prefill_phase_barrier);
 
-                // NVBugs 5969206: Do NOT link prefill as child (same rationale as bootstrap path).
+                // NVBugs 5969206: Do NOT link prefill as child (same rationale).
                 let prefill_context = Context::with_id(prefill_req, request_id.clone());
 
                 // In Direct mode, pass preselected_worker so execute_prefill uses

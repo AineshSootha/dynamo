@@ -21,6 +21,12 @@ from vllm.renderers.embed_utils import safe_load_prompt_embeds
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
+_PREFILL_TTL_SECONDS: Final[Optional[float]] = (
+    float(os.environ["DYN_PREFILL_TTL_SECONDS"])
+    if os.environ.get("DYN_PREFILL_TTL_SECONDS")
+    else None
+)
+
 from dynamo._core import Context
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
@@ -2145,40 +2151,45 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 self.runtime.shutdown()
                 os._exit(1)
 
-            async for res in gen:
-                logger.debug(f"kv transfer params: {res.kv_transfer_params}")
+            try:
+                async with asyncio.timeout(_PREFILL_TTL_SECONDS):
+                    async for res in gen:
+                        logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                token_ids = res.outputs[0].token_ids if res.outputs else []
+                        token_ids = res.outputs[0].token_ids if res.outputs else []
 
-                # For prefill worker, only one res will be generated,
-                # so we can always build embedding params here without conditionals
-                embedding_params = self._build_embedding_params(
-                    multi_modal_data or {}, res.prompt_token_ids
+                        embedding_params = self._build_embedding_params(
+                            multi_modal_data or {}, res.prompt_token_ids
+                        )
+                        output: Dict[str, Any] = {
+                            "token_ids": list(token_ids),
+                            "disaggregated_params": self._build_disaggregated_params(
+                                res.kv_transfer_params,
+                                embedding_params,
+                            ),
+                            "completion_usage": BaseWorkerHandler._build_completion_usage(
+                                request_output=res,
+                                embedding_sequence_length=embedding_sequence_length,
+                            ),
+                        }
+
+                        self._log_with_lora_context(
+                            "Prefill completed for request {request_id}{lora_info}: "
+                            "generated {token_count} token(s), has_kv_params={has_kv_params}",
+                            request_id,
+                            lora_request,
+                            level="info" if lora_request else "debug",
+                            token_count=len(token_ids),
+                            has_kv_params=res.kv_transfer_params is not None,
+                        )
+
+                        yield output
+            except TimeoutError:
+                logger.warning(
+                    f"Prefill TTL ({_PREFILL_TTL_SECONDS}s) expired for request "
+                    f"{request_id}, aborting"
                 )
-                output: Dict[str, Any] = {
-                    "token_ids": list(token_ids),
-                    "disaggregated_params": self._build_disaggregated_params(
-                        res.kv_transfer_params,
-                        embedding_params,
-                    ),
-                    "completion_usage": BaseWorkerHandler._build_completion_usage(
-                        request_output=res,
-                        embedding_sequence_length=embedding_sequence_length,
-                    ),
-                }
-
-                # Log prefill completion with LoRA info
-                self._log_with_lora_context(
-                    "Prefill completed for request {request_id}{lora_info}: "
-                    "generated {token_count} token(s), has_kv_params={has_kv_params}",
-                    request_id,
-                    lora_request,
-                    level="info" if lora_request else "debug",
-                    token_count=len(token_ids),
-                    has_kv_params=res.kv_transfer_params is not None,
-                )
-
-                yield output
+                await self.engine_client.abort(request_id)
 
     def _build_disaggregated_params(
         self, kv_transfer_params, embedding_params=None, expanded_prompt_token_ids=None
