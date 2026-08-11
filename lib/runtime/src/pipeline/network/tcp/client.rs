@@ -392,13 +392,38 @@ async fn handle_writer(
             }
         };
 
-        if let Err(e) = framed_writer.send(msg).await {
-            tracing::trace!(
-                "failed to send message to network; possible disconnect: {:?}",
-                e
-            );
-            send_sentinel = false;
-            break;
+        // Make the response write cancellable. The work-handler concurrency
+        // permit is held for the whole of handle_payload, so a write that blocks
+        // on TCP backpressure to a slow or disconnected consumer would pin that
+        // permit until the socket finally errored. Racing the send against the
+        // cancellation signals lets a client-gone (stop/kill) event abort the
+        // in-flight write and release the permit immediately.
+        let send_outcome = tokio::select! {
+            biased;
+
+            _ = context.killed() => None,
+            _ = context.stopped() => None,
+
+            result = framed_writer.send(msg) => Some(result),
+        };
+
+        match send_outcome {
+            None => {
+                tracing::trace!(
+                    "response write aborted; client cancelled (context stopped/killed)"
+                );
+                send_sentinel = false;
+                break;
+            }
+            Some(Err(e)) => {
+                tracing::trace!(
+                    "failed to send message to network; possible disconnect: {:?}",
+                    e
+                );
+                send_sentinel = false;
+                break;
+            }
+            Some(Ok(())) => {}
         }
     }
 
