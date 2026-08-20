@@ -1123,6 +1123,16 @@ impl ModelDeploymentCard {
                 if let Some(model_dir) = p.parent() {
                     crate::tokenizers::hf::merge_special_tokens_from_config(&mut hf, model_dir);
                 }
+
+                // Disable serialized padding for online requests.
+                if hf.get_padding().is_some() {
+                    tracing::warn!(
+                        "tokenizer.json declares a padding config; disabling it for online \
+                         tokenization"
+                    );
+                    hf.with_padding(None);
+                }
+
                 // Hold onto specials before any move of `hf`.
                 let specials: Vec<String> = if cache_enabled {
                     extract_hf_special_tokens(&hf)
