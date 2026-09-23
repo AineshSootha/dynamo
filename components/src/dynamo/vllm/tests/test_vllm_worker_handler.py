@@ -1141,7 +1141,12 @@ class TestDeferredAbort:
         config = _make_config(disaggregation_mode="DECODE")
         handler = _make_handler(config=config)
         handler.engine_client = MagicMock()
-        handler.engine_client.abort = AsyncMock()
+        abort_seen = asyncio.Event()
+
+        async def _abort(_request_id):
+            abort_seen.set()
+
+        handler.engine_client.abort = AsyncMock(side_effect=_abort)
         handler.shutdown_event = None
         handler.runtime = MagicMock()
         handler.config = config
@@ -1169,7 +1174,7 @@ class TestDeferredAbort:
         context.async_killed_or_stopped.return_value = killed_future
 
         async def _empty_gen(*args, **kwargs):
-            await asyncio.sleep(0)
+            await abort_seen.wait()
             if False:
                 yield None
             return
