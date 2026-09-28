@@ -35,6 +35,7 @@ from dynamo.common.multimodal.mm_kwargs_transfer import (
 )
 from dynamo.common.multimodal.routing_utils import build_mm_routing_info_from_features
 from dynamo.common.utils import nvtx_utils as _nvtx
+from dynamo.common.utils.gc_freeze import maybe_freeze_gc_heap
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
 
@@ -1098,6 +1099,16 @@ class EngineFactory:
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none
+        )
+
+        # The tokenizer, InputProcessor/OutputProcessor, ModelConfig and the
+        # parser classes built above are the bulk of this process's long-lived
+        # heap. Without a freeze every gen2 collection re-walks them, which
+        # under load stalls the event loop for hundreds of ms every few
+        # seconds. One blocking collect+freeze per model registration instead.
+        maybe_freeze_gc_heap(
+            self.config.freeze_gc_heap,
+            context=f"vLLM chat processor for {mdc.name()!r}",
         )
 
         return PythonAsyncEngine(gen.generator, loop)

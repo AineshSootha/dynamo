@@ -29,6 +29,7 @@ from dynamo.common.snapshot.restore_context import (
     parse_snapshot_restore_runtime_config,
     refresh_snapshot_restore_config,
 )
+from dynamo.common.utils.gc_freeze import install_gc_pause_logger, maybe_freeze_gc_heap
 from dynamo.common.utils.graceful_shutdown import install_signal_handlers
 from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
@@ -115,6 +116,10 @@ async def worker(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
     config = parse_args(argv)
+    # Before the engine and runtime come up, so startup-time collections are
+    # visible too when an operator is chasing a stall. This process only:
+    # EngineCore and the GPU workers are separate interpreters.
+    install_gc_pause_logger(config.gc_pause_log_ms)
 
     dump_config(config.dump_config_to, config)
 
@@ -738,6 +743,17 @@ async def register_vllm_model(
     # This enables frontend to decode images and transfer via NIXL RDMA
     media_decoder, media_fetcher = create_frontend_media_config(
         config.frontend_decoding
+    )
+
+    # Everything long-lived this process will ever hold (engine client,
+    # tokenizer, vllm_config, runtime bindings) exists by now, and the
+    # frontend only routes traffic to us once register_model returns, so
+    # freezing here means the one blocking collect never overlaps a request
+    # and later gen2 collections stop re-walking the static heap. See
+    # dynamo.common.utils.gc_freeze for the measured stall this removes.
+    maybe_freeze_gc_heap(
+        config.freeze_gc_heap,
+        context=f"engine init for {model_type} model {config.served_model_name!r}",
     )
 
     await register_model(
